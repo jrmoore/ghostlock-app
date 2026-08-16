@@ -232,7 +232,8 @@ fn run(cli: &Cli) -> Result<i32> {
     if kernel_phys_load.is_none() && (boot.mtk_lz4 || boot.mtk_gzip) {
         if let Some(text_base) = text_base {
             let derived = text_base - MTK_VADDR_BASE;
-            if derived > 0 && derived <= 0xFFFF_FFFF {
+            // More permissive validation: allow typical MediaTek DRAM ranges.
+            if derived >= 0x8000_0000 && derived <= 0xC000_0000 {
                 eprintln!(
                     "info: MediaTek compressed image; kernel_phys_load derived \
                      from _text: 0x{derived:x} (DRAM base; pass --phys to override)"
