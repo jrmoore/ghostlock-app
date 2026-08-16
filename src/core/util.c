@@ -317,7 +317,7 @@ int prepare_skb_payload(uintptr_t base) {
   memset(skb_buf, 0, SKB_SEND_SIZE);
 
   /* Check for overflow in payload_base calculation */
-  if (base > UINTPTR_MAX - SKB_DATA_DELTA) {
+  if (base < (uintptr_t)(-SKB_DATA_DELTA)) {
     pr_error("prepare_skb_payload: base=0x%zx would overflow with SKB_DATA_DELTA\n", base);
     return 0;
   }
